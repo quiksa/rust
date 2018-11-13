@@ -193,9 +193,6 @@ impl Command {
         if let Some(ref cwd) = *self.get_cwd() {
             t!(cvt(libc::chdir(cwd.as_ptr())));
         }
-        if let Some(envp) = maybe_envp {
-            *sys::os::environ() = envp.as_ptr();
-        }
 
         // emscripten has no signal support.
         #[cfg(not(any(target_os = "emscripten")))]
@@ -229,6 +226,30 @@ impl Command {
 
         for callback in self.get_closures().iter_mut() {
             t!(callback());
+        }
+
+        // Note that we're accessing process-global state, `environ`, which
+        // means we need the rust-specific environment lock. Although we're
+        // performing an exec here we may also return with an error from this
+        // function (without actually exec'ing) in which case we want to be sure
+        // to restore the global environment back to what it once was, ensuring
+        // that our temporary override, when free'd, doesn't corrupt our
+        // process's environment.
+        let _lock = sys::os::env_lock();
+        let mut _reset = None;
+        if let Some(envp) = maybe_envp {
+            struct Reset(*const *const libc::c_char);
+
+            impl Drop for Reset {
+                fn drop(&mut self) {
+                    unsafe {
+                        *sys::os::environ() = self.0;
+                    }
+                }
+            }
+
+            _reset = Some(Reset(*sys::os::environ()));
+            *sys::os::environ() = envp.as_ptr();
         }
 
         libc::execvp(self.get_argv()[0], self.get_argv().as_ptr());
@@ -330,6 +351,10 @@ impl Command {
                 libc::POSIX_SPAWN_SETSIGMASK;
             cvt(libc::posix_spawnattr_setflags(&mut attrs.0, flags as _))?;
 
+            // We'e reading `sys::os::environ` below so make sure that we do so
+            // in a synchronized fashion via the rust-specific global
+            // environment lock.
+            let _lock = sys::os::env_lock();
             let envp = envp.map(|c| c.as_ptr())
                 .unwrap_or_else(|| *sys::os::environ() as *const _);
             let ret = libc::posix_spawnp(
