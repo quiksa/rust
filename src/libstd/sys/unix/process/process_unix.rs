@@ -8,8 +8,6 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use env;
-use ffi::CString;
 use io::{self, Error, ErrorKind};
 use libc::{self, c_int, gid_t, pid_t, uid_t};
 use ptr;
@@ -41,15 +39,13 @@ impl Command {
             return Ok((ret, ours))
         }
 
-        let possible_paths = self.compute_possible_paths(envp.as_ref());
-
         let (input, output) = sys::pipe::anon_pipe()?;
 
         let pid = unsafe {
             match cvt(libc::fork())? {
                 0 => {
                     drop(input);
-                    let err = self.do_exec(theirs, envp.as_ref(), possible_paths);
+                    let err = self.do_exec(theirs, envp.as_ref());
                     let errno = err.raw_os_error().unwrap_or(libc::EINVAL) as u32;
                     let bytes = [
                         (errno >> 24) as u8,
@@ -117,46 +113,10 @@ impl Command {
                                   "nul byte found in provided data")
         }
 
-        let possible_paths = self.compute_possible_paths(envp.as_ref());
         match self.setup_io(default, true) {
-            Ok((_, theirs)) => unsafe { self.do_exec(theirs, envp.as_ref(), possible_paths) },
+            Ok((_, theirs)) => unsafe { self.do_exec(theirs, envp.as_ref()) },
             Err(e) => e,
         }
-    }
-
-    fn compute_possible_paths(&self, maybe_envp: Option<&CStringArray>) -> Option<Vec<CString>> {
-        let program = self.get_program().as_bytes();
-        if program.contains(&b'/') {
-            return None;
-        }
-        // Outside the match so we can borrow it for the lifetime of the function.
-        let parent_path = env::var("PATH").ok();
-        let paths = match maybe_envp {
-            Some(envp) => {
-                match envp.get_items().iter().find(|var| var.as_bytes().starts_with(b"PATH=")) {
-                    Some(p) => &p.as_bytes()[5..],
-                    None => return None,
-                }
-            },
-            // maybe_envp is None if the process isn't changing the parent's env at all.
-            None => {
-                match parent_path.as_ref() {
-                    Some(p) => p.as_bytes(),
-                    None => return None,
-                }
-            },
-        };
-
-        let mut possible_paths = vec![];
-        for path in paths.split(|p| *p == b':') {
-            let mut binary_path = Vec::with_capacity(program.len() + path.len() + 1);
-            binary_path.extend_from_slice(path);
-            binary_path.push(b'/');
-            binary_path.extend_from_slice(program);
-            let c_binary_path = CString::new(binary_path).unwrap();
-            possible_paths.push(c_binary_path);
-        }
-        return Some(possible_paths);
     }
 
     // And at this point we've reached a special time in the life of the
@@ -192,8 +152,7 @@ impl Command {
     unsafe fn do_exec(
         &mut self,
         stdio: ChildPipes,
-        maybe_envp: Option<&CStringArray>,
-        maybe_possible_paths: Option<Vec<CString>>,
+        maybe_envp: Option<&CStringArray>
     ) -> io::Error {
         use sys::{self, cvt_r};
 
@@ -269,53 +228,32 @@ impl Command {
             t!(callback());
         }
 
-        // If the program isn't an absolute path, and our environment contains a PATH var, then we
-        // implement the PATH traversal ourselves so that it honors the child's PATH instead of the
-        // parent's. This mirrors the logic that exists in glibc's execvpe, except using the
-        // child's env to fetch PATH.
-        match maybe_possible_paths {
-            Some(possible_paths) => {
-                let mut pending_error = None;
-                for path in possible_paths {
-                    libc::execve(
-                        path.as_ptr(),
-                        self.get_argv().as_ptr(),
-                        maybe_envp.map(|envp| envp.as_ptr()).unwrap_or_else(|| *sys::os::environ())
-                    );
-                    let err = io::Error::last_os_error();
-                    match err.kind() {
-                        io::ErrorKind::PermissionDenied => {
-                            // If we saw a PermissionDenied, and none of the other entries in
-                            // $PATH are successful, then we'll return the first EACCESS we see.
-                            if pending_error.is_none() {
-                                pending_error = Some(err);
-                            }
-                        },
-                        // Errors which indicate we failed to find a file are ignored and we try
-                        // the next entry in the path.
-                        io::ErrorKind::NotFound | io::ErrorKind::TimedOut => {
-                            continue
-                        },
-                        // Any other error means we found a file and couldn't execute it.
-                        _ => {
-                            return err;
-                        }
+        // Note that we're accessing process-global state, `environ`, which
+        // means we need the rust-specific environment lock. Although we're
+        // performing an exec here we may also return with an error from this
+        // function (without actually exec'ing) in which case we want to be sure
+        // to restore the global environment back to what it once was, ensuring
+        // that our temporary override, when free'd, doesn't corrupt our
+        // process's environment.
+        let _lock = sys::os::env_lock();
+        let mut _reset = None;
+        if let Some(envp) = maybe_envp {
+            struct Reset(*const *const libc::c_char);
+
+            impl Drop for Reset {
+                fn drop(&mut self) {
+                    unsafe {
+                        *sys::os::environ() = self.0;
                     }
                 }
-                if let Some(err) = pending_error {
-                    return err;
-                }
-                return io::Error::from_raw_os_error(libc::ENOENT);
-            },
-            _ => {
-                libc::execve(
-                    self.get_argv()[0],
-                    self.get_argv().as_ptr(),
-                    maybe_envp.map(|envp| envp.as_ptr()).unwrap_or_else(|| *sys::os::environ())
-                );
-                return io::Error::last_os_error()
             }
+
+            _reset = Some(Reset(*sys::os::environ()));
+            *sys::os::environ() = envp.as_ptr();
         }
+
+        libc::execvp(self.get_argv()[0], self.get_argv().as_ptr());
+        io::Error::last_os_error()
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "freebsd",
@@ -413,6 +351,10 @@ impl Command {
                 libc::POSIX_SPAWN_SETSIGMASK;
             cvt(libc::posix_spawnattr_setflags(&mut attrs.0, flags as _))?;
 
+            // We'e reading `sys::os::environ` below so make sure that we do so
+            // in a synchronized fashion via the rust-specific global
+            // environment lock.
+            let _lock = sys::os::env_lock();
             let envp = envp.map(|c| c.as_ptr())
                 .unwrap_or_else(|| *sys::os::environ() as *const _);
             let ret = libc::posix_spawnp(
